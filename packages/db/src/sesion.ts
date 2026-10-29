@@ -1,55 +1,52 @@
 import { randomBytes } from 'node:crypto';
-import { eq } from 'drizzle-orm';
 import { PASSWORD_DEMO, verificarContrasena } from './auth';
-import { getDb } from './client';
-import { fraccionamientos, membresias, sesiones, usuarios } from './schema';
+import { faltanTablas, getDb, pedir } from './client';
 import { comoRol, type FraccionamientoSesion, type MembresiaSesion, type Rol, type Sesion } from './tipos';
 
 const DIAS_SESION = 14;
 const DESTACADAS = ['usr-elena', 'usr-luis', 'usr-mariana', 'usr-diego'];
 
+type UsuarioFila = { id: string; nombre: string; correo: string; hash_contrasena: string | null };
+type MembresiaFila = {
+	rol: string;
+	fraccionamientos: { id: string; nombre: string; ciudad: string; estado: string };
+};
+
 export async function validarCredenciales(correo: string, contrasena: string) {
-	const db = await getDb();
-	const filasUsuario = await db
-		.select()
-		.from(usuarios)
-		.where(eq(usuarios.correo, correo.trim().toLowerCase()))
-		.limit(1);
-	const usuario = filasUsuario[0];
-	if (!usuario?.hashContrasena) return null;
-	const valida = await verificarContrasena(contrasena, usuario.hashContrasena);
+	const sb = getDb();
+	const usuario = pedir(
+		await sb.from('usuarios').select('id, nombre, correo, hash_contrasena').eq('correo', correo.trim().toLowerCase()).maybeSingle()
+	) as UsuarioFila | null;
+	if (!usuario?.hash_contrasena) return null;
+	const valida = await verificarContrasena(contrasena, usuario.hash_contrasena);
 	if (!valida) return null;
 	return { id: usuario.id, nombre: usuario.nombre, correo: usuario.correo };
 }
 
 export async function membresiasDe(usuarioId: string): Promise<MembresiaSesion[]> {
-	const db = await getDb();
-	const filas = await db
-		.select({
-			rol: membresias.rol,
-			fraccionamientoId: fraccionamientos.id,
-			nombre: fraccionamientos.nombre,
-			ciudad: fraccionamientos.ciudad,
-			estado: fraccionamientos.estado
-		})
-		.from(membresias)
-		.innerJoin(fraccionamientos, eq(fraccionamientos.id, membresias.fraccionamientoId))
-		.where(eq(membresias.usuarioId, usuarioId));
+	const sb = getDb();
+	const filas = pedir(
+		await sb
+			.from('membresias')
+			.select('rol, fraccionamientos!inner(id, nombre, ciudad, estado)')
+			.eq('usuario_id', usuarioId)
+	) as MembresiaFila[];
 
 	const grupos = new Map<string, MembresiaSesion>();
 	for (const fila of filas) {
 		const rol = comoRol(fila.rol);
 		if (!rol) continue;
-		const actual = grupos.get(fila.fraccionamientoId);
+		const fra = fila.fraccionamientos;
+		const actual = grupos.get(fra.id);
 		if (actual) {
 			actual.roles.push(rol);
 			continue;
 		}
-		grupos.set(fila.fraccionamientoId, {
-			fraccionamientoId: fila.fraccionamientoId,
-			nombre: fila.nombre,
-			ciudad: fila.ciudad,
-			estado: fila.estado,
+		grupos.set(fra.id, {
+			fraccionamientoId: fra.id,
+			nombre: fra.nombre,
+			ciudad: fra.ciudad,
+			estado: fra.estado,
 			roles: [rol]
 		});
 	}
@@ -57,51 +54,59 @@ export async function membresiasDe(usuarioId: string): Promise<MembresiaSesion[]
 }
 
 export async function crearSesion(usuarioId: string, fraccionamientoId: string) {
-	const db = await getDb();
+	const sb = getDb();
 	const token = randomBytes(32).toString('hex');
-	const expiraEn = new Date(Date.now() + DIAS_SESION * 24 * 60 * 60 * 1000);
-	await db.insert(sesiones).values({ token, usuarioId, fraccionamientoId, expiraEn });
+	const expiraEn = new Date(Date.now() + DIAS_SESION * 24 * 60 * 60 * 1000).toISOString();
+	pedir(
+		await sb.from('sesiones').insert({ token, usuario_id: usuarioId, fraccionamiento_id: fraccionamientoId, expira_en: expiraEn })
+	);
 	return token;
 }
 
 export async function cerrarSesion(token: string) {
-	const db = await getDb();
-	await db.delete(sesiones).where(eq(sesiones.token, token));
+	const sb = getDb();
+	try {
+		pedir(await sb.from('sesiones').delete().eq('token', token));
+	} catch (error) {
+		if (!faltanTablas(error)) throw error;
+	}
 }
 
 export async function cambiarFraccionamiento(token: string, usuarioId: string, fraccionamientoId: string) {
 	const membresiasUsuario = await membresiasDe(usuarioId);
 	const destino = membresiasUsuario.find((item) => item.fraccionamientoId === fraccionamientoId);
 	if (!destino) return false;
-	const db = await getDb();
-	await db.update(sesiones).set({ fraccionamientoId }).where(eq(sesiones.token, token));
+	const sb = getDb();
+	pedir(await sb.from('sesiones').update({ fraccionamiento_id: fraccionamientoId }).eq('token', token));
 	return true;
 }
 
 export async function leerSesion(token: string): Promise<Sesion | null> {
-	const db = await getDb();
-	const encontradas = await db.select().from(sesiones).where(eq(sesiones.token, token)).limit(1);
-	const sesion = encontradas[0];
+	const sb = getDb();
+	const sesion = pedir(
+		await sb.from('sesiones').select('token, usuario_id, fraccionamiento_id, expira_en').eq('token', token).maybeSingle()
+	) as { usuario_id: string; fraccionamiento_id: string; expira_en: string } | null;
 	if (!sesion) return null;
-	if (sesion.expiraEn.getTime() < Date.now()) {
-		await db.delete(sesiones).where(eq(sesiones.token, token));
+	if (new Date(sesion.expira_en).getTime() < Date.now()) {
+		await cerrarSesion(token);
 		return null;
 	}
 
-	const usuarioFilas = await db.select().from(usuarios).where(eq(usuarios.id, sesion.usuarioId)).limit(1);
-	const usuario = usuarioFilas[0];
+	const usuario = pedir(
+		await sb.from('usuarios').select('id, nombre, correo').eq('id', sesion.usuario_id).maybeSingle()
+	) as { id: string; nombre: string; correo: string } | null;
 	if (!usuario) return null;
 
 	const lista = await membresiasDe(usuario.id);
 	if (lista.length === 0) {
-		await db.delete(sesiones).where(eq(sesiones.token, token));
+		await cerrarSesion(token);
 		return null;
 	}
 
-	let actual = lista.find((item) => item.fraccionamientoId === sesion.fraccionamientoId);
+	let actual = lista.find((item) => item.fraccionamientoId === sesion.fraccionamiento_id);
 	if (!actual) {
 		actual = lista[0];
-		await db.update(sesiones).set({ fraccionamientoId: actual.fraccionamientoId }).where(eq(sesiones.token, token));
+		pedir(await sb.from('sesiones').update({ fraccionamiento_id: actual.fraccionamientoId }).eq('token', token));
 	}
 
 	const fraccionamiento: FraccionamientoSesion = {
@@ -121,47 +126,42 @@ export async function leerSesion(token: string): Promise<Sesion | null> {
 
 export async function listarCuentasDemo() {
 	if (process.env.VIENNA_DEMO === '0') return null;
-	if (process.env.DATABASE_URL && process.env.VIENNA_DEMO !== '1') return null;
+	const sb = getDb();
+	let filas: Array<{
+		id: string;
+		nombre: string;
+		correo: string;
+		membresias: Array<{ rol: string; fraccionamientos: { nombre: string } }>;
+	}>;
+	try {
+		filas = pedir(
+		await sb
+			.from('usuarios')
+			.select('id, nombre, correo, membresias(rol, fraccionamientos!inner(nombre))')
+			.like('correo', '%@vienna.local')
+		);
+	} catch (error) {
+		if (faltanTablas(error)) return null;
+		throw error;
+	}
 
-	const db = await getDb();
-	const filas = await db
-		.select({
-			id: usuarios.id,
-			nombre: usuarios.nombre,
-			correo: usuarios.correo,
-			rol: membresias.rol,
-			fraccionamientoId: fraccionamientos.id,
-			fraccionamiento: fraccionamientos.nombre
-		})
-		.from(usuarios)
-		.innerJoin(membresias, eq(membresias.usuarioId, usuarios.id))
-		.innerJoin(fraccionamientos, eq(fraccionamientos.id, membresias.fraccionamientoId));
-
-	const cuentas = new Map<
-		string,
-		{
-			id: string;
-			nombre: string;
-			correo: string;
-			fraccionamientos: { nombre: string; roles: Rol[] }[];
-		}
-	>();
-
+	const cuentas = new Map<string, { id: string; nombre: string; correo: string; fraccionamientos: { nombre: string; roles: Rol[] }[] }>();
 	for (const fila of filas) {
-		if (!fila.correo.endsWith('@vienna.local')) continue;
-		const rol = comoRol(fila.rol);
-		if (!rol) continue;
-		let cuenta = cuentas.get(fila.id);
-		if (!cuenta) {
-			cuenta = { id: fila.id, nombre: fila.nombre, correo: fila.correo, fraccionamientos: [] };
-			cuentas.set(fila.id, cuenta);
+		for (const membresia of fila.membresias ?? []) {
+			const rol = comoRol(membresia.rol);
+			if (!rol) continue;
+			let cuenta = cuentas.get(fila.id);
+			if (!cuenta) {
+				cuenta = { id: fila.id, nombre: fila.nombre, correo: fila.correo, fraccionamientos: [] };
+				cuentas.set(fila.id, cuenta);
+			}
+			let grupo = cuenta.fraccionamientos.find((item) => item.nombre === membresia.fraccionamientos.nombre);
+			if (!grupo) {
+				grupo = { nombre: membresia.fraccionamientos.nombre, roles: [] };
+				cuenta.fraccionamientos.push(grupo);
+			}
+			grupo.roles.push(rol);
 		}
-		let grupo = cuenta.fraccionamientos.find((item) => item.nombre === fila.fraccionamiento);
-		if (!grupo) {
-			grupo = { nombre: fila.fraccionamiento, roles: [] };
-			cuenta.fraccionamientos.push(grupo);
-		}
-		grupo.roles.push(rol);
 	}
 
 	const todas = [...cuentas.values()];
@@ -172,28 +172,32 @@ export async function listarCuentasDemo() {
 }
 
 export async function vincularUsuarioGoogle(datos: { supabaseId: string; correo: string; nombre: string }) {
-	const db = await getDb();
+	const sb = getDb();
 	const correo = datos.correo.trim().toLowerCase();
 	const nombre = datos.nombre.trim() || 'Vecino';
 
-	const porIdentidad = await db.select().from(usuarios).where(eq(usuarios.supabaseId, datos.supabaseId)).limit(1);
-	if (porIdentidad[0]) {
-		return { id: porIdentidad[0].id, nombre: porIdentidad[0].nombre, correo: porIdentidad[0].correo };
+	const porIdentidad = pedir(
+		await sb.from('usuarios').select('id, nombre, correo').eq('supabase_id', datos.supabaseId).maybeSingle()
+	) as { id: string; nombre: string; correo: string } | null;
+	if (porIdentidad) return porIdentidad;
+
+	const porCorreo = pedir(
+		await sb.from('usuarios').select('id, nombre, correo').eq('correo', correo).maybeSingle()
+	) as { id: string; nombre: string; correo: string } | null;
+	if (porCorreo) {
+		pedir(await sb.from('usuarios').update({ supabase_id: datos.supabaseId }).eq('id', porCorreo.id));
+		return porCorreo;
 	}
 
-	const porCorreo = await db.select().from(usuarios).where(eq(usuarios.correo, correo)).limit(1);
-	if (porCorreo[0]) {
-		await db.update(usuarios).set({ supabaseId: datos.supabaseId }).where(eq(usuarios.id, porCorreo[0].id));
-		return { id: porCorreo[0].id, nombre: porCorreo[0].nombre, correo: porCorreo[0].correo };
-	}
-
-	await db.insert(usuarios).values({
-		id: datos.supabaseId,
-		nombre,
-		correo,
-		telefono: null,
-		hashContrasena: null,
-		supabaseId: datos.supabaseId
-	});
+	pedir(
+		await sb.from('usuarios').insert({
+			id: datos.supabaseId,
+			nombre,
+			correo,
+			telefono: null,
+			hash_contrasena: null,
+			supabase_id: datos.supabaseId
+		})
+	);
 	return { id: datos.supabaseId, nombre, correo };
 }

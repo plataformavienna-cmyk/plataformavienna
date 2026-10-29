@@ -10,7 +10,7 @@ Dueño, habitante, vivienda e incidencia son relaciones. La reincidencia es un c
 
 ## Arrancar
 
-Copia la URI del pooler a `apps/web/.env` (`DATABASE_URL`) y ejecuta `supabase/schema.sql` en el editor SQL. Después:
+En `apps/web/.env` van `PUBLIC_SUPABASE_URL`, `PUBLIC_SUPABASE_ANON_KEY` y `SERVICE_ROLE_KEY`. Ejecuta `supabase/schema.sql` en el editor SQL. Después:
 
 ```bash
 pnpm install
@@ -32,14 +32,12 @@ Abre http://localhost:5173.
 5. En `apps/web/.env`:
 
 ```
-DATABASE_URL=postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
 PUBLIC_SUPABASE_URL=https://<ref>.supabase.co
-PUBLIC_SUPABASE_ANON_KEY=<anon o publishable>
+PUBLIC_SUPABASE_ANON_KEY=<anon public>
+SERVICE_ROLE_KEY=<service_role>
 ```
 
-Usa la URI del pooler en modo transacción (puerto 6543).
-
-El navegador solo habla con Supabase para entrar con Google. Las consultas de incidencias las hace el servidor con `DATABASE_URL`, filtrando por el fraccionamiento de la sesión. El SQL cierra el acceso de la llave anónima a las tablas.
+El navegador solo usa la URL y la llave anon para entrar con Google. Las consultas las hace el servidor con `SERVICE_ROLE_KEY`, filtrando por el fraccionamiento de la sesión.
 
 Quien entre con Google y no tenga una membresía con ese correo ve una página de espera. Administración lo da de alta en `usuarios` y `membresias` usando ese mismo correo.
 
@@ -50,7 +48,7 @@ El build ya usa `@sveltejs/adapter-vercel`.
 1. Importa el repositorio.
 2. Root Directory: `apps/web`.
 3. Activa «Include source files outside of the Root Directory», porque el código de la base vive en `packages/db`.
-4. Variables de entorno: `DATABASE_URL`, `PUBLIC_SUPABASE_URL`, `PUBLIC_SUPABASE_ANON_KEY`.
+4. Variables de entorno: `PUBLIC_SUPABASE_URL`, `PUBLIC_SUPABASE_ANON_KEY`, `SERVICE_ROLE_KEY`.
 5. Agrega la URL de producción en las redirecciones de Supabase, como arriba.
 
 ## Qué ve cada cuenta

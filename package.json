@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "pnpm --filter @vienna/web dev",
     "build": "pnpm --filter @vienna/web build",
-    "check": "pnpm --filter @vienna/web check"
+    "check": "pnpm --filter @vienna/web check",
+    "db:aplicar": "pnpm --filter @vienna/db aplicar"
   },
   "engines": {
     "node": ">=22"

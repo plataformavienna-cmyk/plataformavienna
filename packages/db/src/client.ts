@@ -1,52 +1,32 @@
-import { drizzle as drizzlePg, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
-import * as schema from './schema';
-import { fraccionamientos } from './schema';
-import { sembrar } from './seed';
-import { schemaSql } from './sql';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-export type AppDb = PostgresJsDatabase<typeof schema>;
-
-const estado = globalThis as unknown as { viennaDb?: Promise<AppDb> };
-
-async function sembrarSiToca(db: AppDb) {
-	if (process.env.VIENNA_SEED !== '1') return;
-	const existentes = await db.select({ id: fraccionamientos.id }).from(fraccionamientos).limit(1);
-	if (existentes.length > 0) return;
-	await sembrar(db);
-}
-
-async function abrir(): Promise<AppDb> {
-	const url = process.env.DATABASE_URL;
-	if (!url) {
-		throw new Error('Falta DATABASE_URL en apps/web/.env. Vienna usa la base de Supabase.');
-	}
-
-	const cliente = postgres(url, {
-		prepare: false,
-		max: process.env.VERCEL ? 1 : 5
-	});
-	await cliente.unsafe(schemaSql);
-	const db = drizzlePg({ client: cliente, schema });
-	await sembrarSiToca(db);
-	console.log('Vienna conectada a Supabase.');
-	return db;
-}
+const estado = globalThis as unknown as { viennaSb?: SupabaseClient };
 
 export function getDb() {
-	if (!estado.viennaDb) {
-		estado.viennaDb = abrir().catch((error) => {
-			estado.viennaDb = undefined;
-			throw error;
+	if (!estado.viennaSb) {
+		const entorno = process.env;
+		const url = entorno['PUBLIC_SUPABASE_URL'];
+		const llave = entorno['SERVICE_ROLE_KEY'];
+		if (!url || !llave) {
+			throw new Error('Faltan PUBLIC_SUPABASE_URL y SERVICE_ROLE_KEY en apps/web/.env.');
+		}
+		estado.viennaSb = createClient(url, llave, {
+			auth: { persistSession: false, autoRefreshToken: false }
 		});
 	}
-	return estado.viennaDb;
+	return estado.viennaSb;
 }
 
-export function filas<T>(resultado: unknown): T[] {
-	if (Array.isArray(resultado)) return resultado as T[];
-	if (resultado && typeof resultado === 'object' && 'rows' in resultado) {
-		return (resultado as { rows: T[] }).rows;
+export function faltanTablas(error: unknown) {
+	return error instanceof Error && error.message.startsWith('Faltan las tablas');
+}
+
+export function pedir(resultado: { data: unknown; error: { message: string; code?: string } | null }) {
+	if (resultado.error) {
+		if (resultado.error.code === 'PGRST205') {
+			throw new Error('Faltan las tablas. Ejecuta supabase/schema.sql en el editor SQL de Supabase.');
+		}
+		throw new Error(resultado.error.message);
 	}
-	return [];
+	return resultado.data as any;
 }

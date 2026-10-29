@@ -1,41 +1,81 @@
 import { randomUUID } from 'node:crypto';
-import { and, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
-import { filas, getDb } from './client';
-import {
-	cuotas,
-	implicados,
-	incidencias,
-	membresias,
-	ocupaciones,
-	pagos,
-	sucesos,
-	titularidades,
-	usuarios,
-	viviendas
-} from './schema';
+import { getDb, pedir } from './client';
 import { clasificarReincidencia, direccion, esComite, hoyMexico, type Rol, type Vinculos } from './tipos';
 
 function numero(valor: unknown) {
 	return Number(valor ?? 0);
 }
 
+function hace(dias: number) {
+	return Date.now() - dias * 24 * 60 * 60 * 1000;
+}
+
+type IncidenciaBase = {
+	id: string;
+	vivienda_id: string;
+	estado: string;
+	ocurrio_en: string;
+	categoria?: string;
+	implicados?: Array<{ usuario_id: string }>;
+};
+
+async function incidenciasDelFraccionamiento(fraId: string) {
+	const sb = getDb();
+	return pedir(
+		await sb.from('incidencias').select('id, vivienda_id, estado, ocurrio_en, categoria, implicados(usuario_id)').eq('fraccionamiento_id', fraId)
+	) as IncidenciaBase[];
+}
+
+function conteoPersonas(filas: IncidenciaBase[]) {
+	const mapa = new Map<string, { id: string; en90: number; en365: number }>();
+	const limite90 = hace(90);
+	const limite365 = hace(365);
+	for (const fila of filas) {
+		if (fila.estado !== 'confirmada') continue;
+		const cuando = new Date(fila.ocurrio_en).getTime();
+		for (const implicado of fila.implicados ?? []) {
+			const actual = mapa.get(implicado.usuario_id) ?? { id: implicado.usuario_id, en90: 0, en365: 0 };
+			if (cuando >= limite365) actual.en365 += 1;
+			if (cuando >= limite90) actual.en90 += 1;
+			mapa.set(implicado.usuario_id, actual);
+		}
+	}
+	return [...mapa.values()];
+}
+
+function conteoViviendas(filas: IncidenciaBase[]) {
+	const mapa = new Map<string, { id: string; en365: number; abiertas: number }>();
+	const limite365 = hace(365);
+	for (const fila of filas) {
+		const actual = mapa.get(fila.vivienda_id) ?? { id: fila.vivienda_id, en365: 0, abiertas: 0 };
+		if (fila.estado === 'reportada' || fila.estado === 'en_revision') actual.abiertas += 1;
+		if (fila.estado === 'confirmada' && new Date(fila.ocurrio_en).getTime() >= limite365) actual.en365 += 1;
+		mapa.set(fila.vivienda_id, actual);
+	}
+	return [...mapa.values()];
+}
+
 export async function vinculosDeUsuario(fraId: string, usuarioId: string): Promise<Vinculos> {
-	const db = await getDb();
-	const titulares = await db
-		.select({ viviendaId: titularidades.viviendaId })
-		.from(titularidades)
-		.innerJoin(viviendas, eq(viviendas.id, titularidades.viviendaId))
-		.where(
-			and(eq(titularidades.usuarioId, usuarioId), isNull(titularidades.hasta), eq(viviendas.fraccionamientoId, fraId))
-		);
-	const habitadas = await db
-		.select({ viviendaId: ocupaciones.viviendaId })
-		.from(ocupaciones)
-		.innerJoin(viviendas, eq(viviendas.id, ocupaciones.viviendaId))
-		.where(and(eq(ocupaciones.usuarioId, usuarioId), isNull(ocupaciones.hasta), eq(viviendas.fraccionamientoId, fraId)));
+	const sb = getDb();
+	const titulares = pedir(
+		await sb
+			.from('titularidades')
+			.select('vivienda_id, viviendas!inner(fraccionamiento_id)')
+			.eq('usuario_id', usuarioId)
+			.is('hasta', null)
+			.eq('viviendas.fraccionamiento_id', fraId)
+	) as Array<{ vivienda_id: string }>;
+	const habitadas = pedir(
+		await sb
+			.from('ocupaciones')
+			.select('vivienda_id, viviendas!inner(fraccionamiento_id)')
+			.eq('usuario_id', usuarioId)
+			.is('hasta', null)
+			.eq('viviendas.fraccionamiento_id', fraId)
+	) as Array<{ vivienda_id: string }>;
 	return {
-		titulares: titulares.map((fila) => fila.viviendaId),
-		habitadas: habitadas.map((fila) => fila.viviendaId)
+		titulares: titulares.map((fila) => fila.vivienda_id),
+		habitadas: habitadas.map((fila) => fila.vivienda_id)
 	};
 }
 
@@ -44,29 +84,22 @@ export function viviendasRelacionadas(vinculos: Vinculos) {
 }
 
 async function personasDeLaVivienda(viviendaId: string) {
-	const db = await getDb();
-	const duenos = await db
-		.select({ usuarioId: titularidades.usuarioId })
-		.from(titularidades)
-		.where(eq(titularidades.viviendaId, viviendaId));
-	const habitantes = await db
-		.select({ usuarioId: ocupaciones.usuarioId })
-		.from(ocupaciones)
-		.where(eq(ocupaciones.viviendaId, viviendaId));
-	return new Set([...duenos, ...habitantes].map((fila) => fila.usuarioId));
+	const sb = getDb();
+	const duenos = pedir(await sb.from('titularidades').select('usuario_id').eq('vivienda_id', viviendaId)) as Array<{
+		usuario_id: string;
+	}>;
+	const habitantes = pedir(await sb.from('ocupaciones').select('usuario_id').eq('vivienda_id', viviendaId)) as Array<{
+		usuario_id: string;
+	}>;
+	return new Set([...duenos, ...habitantes].map((fila) => fila.usuario_id));
 }
 
 export async function listarDirecciones(fraId: string) {
-	const db = await getDb();
-	const filasVivienda = await db
-		.select()
-		.from(viviendas)
-		.where(eq(viviendas.fraccionamientoId, fraId))
-		.orderBy(viviendas.calle, viviendas.numero);
-	return filasVivienda.map((vivienda) => ({
-		id: vivienda.id,
-		direccion: direccion(vivienda.calle, vivienda.numero)
-	}));
+	const sb = getDb();
+	const filas = pedir(
+		await sb.from('viviendas').select('id, calle, numero').eq('fraccionamiento_id', fraId).order('calle').order('numero')
+	) as Array<{ id: string; calle: string; numero: string }>;
+	return filas.map((vivienda) => ({ id: vivienda.id, direccion: direccion(vivienda.calle, vivienda.numero) }));
 }
 
 type FiltroIncidencias = {
@@ -77,104 +110,96 @@ type FiltroIncidencias = {
 	usuarioId: string;
 };
 
+type IncidenciaLista = {
+	id: string;
+	categoria: string;
+	gravedad: string;
+	estado: string;
+	ocurrio_en: string;
+	reportada_por: string;
+	viviendas: { id: string; calle: string; numero: string };
+	usuarios: { nombre: string };
+};
+
 export async function listarIncidencias(fraId: string, filtro: FiltroIncidencias) {
-	const db = await getDb();
-	const condiciones = [eq(incidencias.fraccionamientoId, fraId)];
-	if (filtro.categoria) condiciones.push(eq(incidencias.categoria, filtro.categoria));
-	if (filtro.estado === 'por_revisar') condiciones.push(inArray(incidencias.estado, ['reportada', 'en_revision']));
-	else if (filtro.estado) condiciones.push(eq(incidencias.estado, filtro.estado));
-
+	const sb = getDb();
+	let consulta = sb
+		.from('incidencias')
+		.select('id, categoria, gravedad, estado, ocurrio_en, reportada_por, viviendas!inner(id, calle, numero), usuarios!inner(nombre)')
+		.eq('fraccionamiento_id', fraId);
+	if (filtro.categoria) consulta = consulta.eq('categoria', filtro.categoria);
+	if (filtro.estado === 'por_revisar') consulta = consulta.in('estado', ['reportada', 'en_revision']);
+	else if (filtro.estado) consulta = consulta.eq('estado', filtro.estado);
 	if (filtro.restringir) {
-		const partes = [];
-		if (filtro.viviendaIds.length > 0) partes.push(inArray(incidencias.viviendaId, filtro.viviendaIds));
-		partes.push(eq(incidencias.reportadaPor, filtro.usuarioId));
-		const combinado = or(...partes);
-		if (combinado) condiciones.push(combinado);
+		const partes = [`reportada_por.eq.${filtro.usuarioId}`];
+		if (filtro.viviendaIds.length > 0) partes.push(`vivienda_id.in.(${filtro.viviendaIds.join(',')})`);
+		consulta = consulta.or(partes.join(','));
 	}
-
-	const filasIncidencia = await db
-		.select({
-			id: incidencias.id,
-			categoria: incidencias.categoria,
-			gravedad: incidencias.gravedad,
-			estado: incidencias.estado,
-			ocurrioEn: incidencias.ocurrioEn,
-			viviendaId: viviendas.id,
-			calle: viviendas.calle,
-			numero: viviendas.numero,
-			reportadaPor: incidencias.reportadaPor,
-			reportante: usuarios.nombre
-		})
-		.from(incidencias)
-		.innerJoin(viviendas, eq(viviendas.id, incidencias.viviendaId))
-		.innerJoin(usuarios, eq(usuarios.id, incidencias.reportadaPor))
-		.where(and(...condiciones))
-		.orderBy(desc(incidencias.ocurrioEn));
-
-	return filasIncidencia.map((fila) => ({
-		...fila,
-		direccion: direccion(fila.calle, fila.numero)
+	const filas = pedir(await consulta.order('ocurrio_en', { ascending: false })) as IncidenciaLista[];
+	return filas.map((fila) => ({
+		id: fila.id,
+		categoria: fila.categoria,
+		gravedad: fila.gravedad,
+		estado: fila.estado,
+		ocurrioEn: fila.ocurrio_en,
+		viviendaId: fila.viviendas.id,
+		calle: fila.viviendas.calle,
+		numero: fila.viviendas.numero,
+		reportadaPor: fila.reportada_por,
+		reportante: fila.usuarios.nombre,
+		direccion: direccion(fila.viviendas.calle, fila.viviendas.numero)
 	}));
 }
 
 export async function obtenerIncidencia(fraId: string, id: string) {
-	const db = await getDb();
-	const encontradas = await db
-		.select({
-			id: incidencias.id,
-			categoria: incidencias.categoria,
-			gravedad: incidencias.gravedad,
-			descripcion: incidencias.descripcion,
-			estado: incidencias.estado,
-			ocurrioEn: incidencias.ocurrioEn,
-			creadaEn: incidencias.creadaEn,
-			respuesta: incidencias.respuesta,
-			notasInternas: incidencias.notasInternas,
-			viviendaId: viviendas.id,
-			calle: viviendas.calle,
-			numero: viviendas.numero,
-			reportadaPor: incidencias.reportadaPor,
-			reportante: usuarios.nombre
-		})
-		.from(incidencias)
-		.innerJoin(viviendas, eq(viviendas.id, incidencias.viviendaId))
-		.innerJoin(usuarios, eq(usuarios.id, incidencias.reportadaPor))
-		.where(and(eq(incidencias.id, id), eq(incidencias.fraccionamientoId, fraId)))
-		.limit(1);
-	const incidencia = encontradas[0];
+	const sb = getDb();
+	const incidencia = pedir(
+		await sb
+			.from('incidencias')
+			.select(
+				'id, categoria, gravedad, descripcion, estado, ocurrio_en, creada_en, respuesta, notas_internas, reportada_por, viviendas!inner(id, calle, numero), usuarios!inner(nombre)'
+			)
+			.eq('id', id)
+			.eq('fraccionamiento_id', fraId)
+			.maybeSingle()
+	) as (IncidenciaLista & { descripcion: string; creada_en: string; respuesta: string | null; notas_internas: string | null }) | null;
 	if (!incidencia) return null;
 
-	const personas = await db
-		.select({ id: usuarios.id, nombre: usuarios.nombre })
-		.from(implicados)
-		.innerJoin(usuarios, eq(usuarios.id, implicados.usuarioId))
-		.where(eq(implicados.incidenciaId, id));
-
-	const ocupantes = await db
-		.select({
-			id: usuarios.id,
-			nombre: usuarios.nombre,
-			telefono: usuarios.telefono,
-			relacion: ocupaciones.relacion
-		})
-		.from(ocupaciones)
-		.innerJoin(usuarios, eq(usuarios.id, ocupaciones.usuarioId))
-		.where(and(eq(ocupaciones.viviendaId, incidencia.viviendaId), isNull(ocupaciones.hasta)))
-		.orderBy(usuarios.nombre);
-
-	const linea = await db
-		.select({ accion: sucesos.accion, creadoEn: sucesos.creadoEn, nombre: usuarios.nombre })
-		.from(sucesos)
-		.innerJoin(usuarios, eq(usuarios.id, sucesos.usuarioId))
-		.where(eq(sucesos.incidenciaId, id))
-		.orderBy(sucesos.creadoEn);
+	const personas = pedir(
+		await sb.from('implicados').select('usuarios!inner(id, nombre)').eq('incidencia_id', id)
+	) as Array<{ usuarios: { id: string; nombre: string } }>;
+	const ocupantes = pedir(
+		await sb
+			.from('ocupaciones')
+			.select('relacion, usuarios!inner(id, nombre, telefono)')
+			.eq('vivienda_id', incidencia.viviendas.id)
+			.is('hasta', null)
+	) as Array<{ relacion: string; usuarios: { id: string; nombre: string; telefono: string | null } }>;
+	const linea = pedir(
+		await sb.from('sucesos').select('accion, creado_en, usuarios!inner(nombre)').eq('incidencia_id', id).order('creado_en')
+	) as Array<{ accion: string; creado_en: string; usuarios: { nombre: string } }>;
 
 	return {
-		...incidencia,
-		direccion: direccion(incidencia.calle, incidencia.numero),
-		implicados: personas,
-		ocupantes,
-		sucesos: linea
+		id: incidencia.id,
+		categoria: incidencia.categoria,
+		gravedad: incidencia.gravedad,
+		descripcion: incidencia.descripcion,
+		estado: incidencia.estado,
+		ocurrioEn: incidencia.ocurrio_en,
+		creadaEn: incidencia.creada_en,
+		respuesta: incidencia.respuesta,
+		notasInternas: incidencia.notas_internas,
+		viviendaId: incidencia.viviendas.id,
+		calle: incidencia.viviendas.calle,
+		numero: incidencia.viviendas.numero,
+		reportadaPor: incidencia.reportada_por,
+		reportante: incidencia.usuarios.nombre,
+		direccion: direccion(incidencia.viviendas.calle, incidencia.viviendas.numero),
+		implicados: personas.map((fila) => fila.usuarios),
+		ocupantes: ocupantes
+			.map((fila) => ({ ...fila.usuarios, relacion: fila.relacion }))
+			.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es')),
+		sucesos: linea.map((fila) => ({ accion: fila.accion, creadoEn: fila.creado_en, nombre: fila.usuarios.nombre }))
 	};
 }
 
@@ -187,34 +212,36 @@ export async function crearIncidencia(input: {
 	descripcion: string;
 	ocurrioEn: Date;
 }) {
-	const db = await getDb();
-	const casa = await db
-		.select({ id: viviendas.id })
-		.from(viviendas)
-		.where(and(eq(viviendas.id, input.viviendaId), eq(viviendas.fraccionamientoId, input.fraId)))
-		.limit(1);
-	if (!casa[0]) return { ok: false as const, error: 'Esa vivienda no está en este fraccionamiento.' };
+	const sb = getDb();
+	const casa = pedir(
+		await sb.from('viviendas').select('id').eq('id', input.viviendaId).eq('fraccionamiento_id', input.fraId).maybeSingle()
+	) as { id: string } | null;
+	if (!casa) return { ok: false as const, error: 'Esa vivienda no está en este fraccionamiento.' };
 
 	const id = randomUUID();
-	await db.insert(incidencias).values({
-		id,
-		fraccionamientoId: input.fraId,
-		viviendaId: input.viviendaId,
-		reportadaPor: input.usuarioId,
-		categoria: input.categoria,
-		gravedad: input.gravedad,
-		descripcion: input.descripcion.trim(),
-		ocurrioEn: input.ocurrioEn,
-		estado: 'reportada',
-		respuesta: null,
-		notasInternas: null
-	});
-	await db.insert(sucesos).values({
-		id: randomUUID(),
-		incidenciaId: id,
-		usuarioId: input.usuarioId,
-		accion: 'Registró la incidencia'
-	});
+	pedir(
+		await sb.from('incidencias').insert({
+			id,
+			fraccionamiento_id: input.fraId,
+			vivienda_id: input.viviendaId,
+			reportada_por: input.usuarioId,
+			categoria: input.categoria,
+			gravedad: input.gravedad,
+			descripcion: input.descripcion.trim(),
+			ocurrio_en: input.ocurrioEn.toISOString(),
+			estado: 'reportada',
+			respuesta: null,
+			notas_internas: null
+		})
+	);
+	pedir(
+		await sb.from('sucesos').insert({
+			id: randomUUID(),
+			incidencia_id: id,
+			usuario_id: input.usuarioId,
+			accion: 'Registró la incidencia'
+		})
+	);
 	return { ok: true as const, id };
 }
 
@@ -227,13 +254,10 @@ export async function resolverIncidencia(input: {
 	notasInternas: string;
 	implicadosIds: string[];
 }) {
-	const db = await getDb();
-	const encontradas = await db
-		.select()
-		.from(incidencias)
-		.where(and(eq(incidencias.id, input.incidenciaId), eq(incidencias.fraccionamientoId, input.fraId)))
-		.limit(1);
-	const actual = encontradas[0];
+	const sb = getDb();
+	const actual = pedir(
+		await sb.from('incidencias').select('id, estado, vivienda_id, notas_internas').eq('id', input.incidenciaId).eq('fraccionamiento_id', input.fraId).maybeSingle()
+	) as { estado: string; vivienda_id: string; notas_internas: string | null } | null;
 	if (!actual) return { ok: false as const, error: 'No encontramos esa incidencia.' };
 	if (actual.estado === 'confirmada' || actual.estado === 'desestimada') {
 		return { ok: false as const, error: 'Esta incidencia ya está cerrada.' };
@@ -241,101 +265,66 @@ export async function resolverIncidencia(input: {
 
 	let implicadosValidos: string[] = [];
 	if (input.accion === 'confirmada') {
-		const permitidos = await personasDeLaVivienda(actual.viviendaId);
+		const permitidos = await personasDeLaVivienda(actual.vivienda_id);
 		implicadosValidos = input.implicadosIds.filter((id) => permitidos.has(id));
 	}
 
-	await db
-		.update(incidencias)
-		.set({
-			estado: input.accion,
-			respuesta: input.respuesta.trim() || null,
-			notasInternas: input.notasInternas.trim() || actual.notasInternas
-		})
-		.where(eq(incidencias.id, input.incidenciaId));
+	pedir(
+		await sb
+			.from('incidencias')
+			.update({
+				estado: input.accion,
+				respuesta: input.respuesta.trim() || null,
+				notas_internas: input.notasInternas.trim() || actual.notas_internas
+			})
+			.eq('id', input.incidenciaId)
+	);
 
 	if (input.accion === 'confirmada') {
-		await db.delete(implicados).where(eq(implicados.incidenciaId, input.incidenciaId));
+		pedir(await sb.from('implicados').delete().eq('incidencia_id', input.incidenciaId));
 		if (implicadosValidos.length > 0) {
-			await db.insert(implicados).values(
-				implicadosValidos.map((usuarioId) => ({
-					incidenciaId: input.incidenciaId,
-					usuarioId
-				}))
+			pedir(
+				await sb.from('implicados').insert(
+					implicadosValidos.map((usuarioId) => ({ incidencia_id: input.incidenciaId, usuario_id: usuarioId }))
+				)
 			);
 		}
 	}
 
 	const texto =
 		input.accion === 'confirmada' ? 'La confirmó' : input.accion === 'desestimada' ? 'La desestimó' : 'La pasó a revisión';
-	await db.insert(sucesos).values({
-		id: randomUUID(),
-		incidenciaId: input.incidenciaId,
-		usuarioId: input.actorId,
-		accion: texto
-	});
+	pedir(
+		await sb.from('sucesos').insert({
+			id: randomUUID(),
+			incidencia_id: input.incidenciaId,
+			usuario_id: input.actorId,
+			accion: texto
+		})
+	);
 	return { ok: true as const };
 }
 
-async function conteoPersonas(fraId: string) {
-	const db = await getDb();
-	const resultado = await db.execute(sql`
-		select im.usuario_id as id,
-			count(*) filter (where i.estado = 'confirmada' and i.ocurrio_en >= now() - interval '90 days') as en90,
-			count(*) filter (where i.estado = 'confirmada' and i.ocurrio_en >= now() - interval '365 days') as en365
-		from implicados im
-		join incidencias i on i.id = im.incidencia_id
-		where i.fraccionamiento_id = ${fraId}
-		group by im.usuario_id
-	`);
-	return filas<{ id: string; en90: unknown; en365: unknown }>(resultado).map((fila) => ({
-		id: fila.id,
-		en90: numero(fila.en90),
-		en365: numero(fila.en365)
-	}));
-}
-
-async function conteoViviendas(fraId: string) {
-	const db = await getDb();
-	const resultado = await db.execute(sql`
-		select vivienda_id as id,
-			count(*) filter (where estado = 'confirmada' and ocurrio_en >= now() - interval '365 days') as en365,
-			count(*) filter (where estado in ('reportada', 'en_revision')) as abiertas
-		from incidencias
-		where fraccionamiento_id = ${fraId}
-		group by vivienda_id
-	`);
-	return filas<{ id: string; en365: unknown; abiertas: unknown }>(resultado).map((fila) => ({
-		id: fila.id,
-		en365: numero(fila.en365),
-		abiertas: numero(fila.abiertas)
-	}));
-}
-
 export async function listarReincidentes(fraId: string) {
-	const db = await getDb();
-	const conteos = await conteoPersonas(fraId);
+	const sb = getDb();
+	const hechos = await incidenciasDelFraccionamiento(fraId);
+	const conteos = conteoPersonas(hechos);
 	const relevantes = conteos.filter((fila) => fila.en365 >= 2);
 	const ids = relevantes.map((fila) => fila.id);
 	const gente = ids.length
-		? await db.select({ id: usuarios.id, nombre: usuarios.nombre }).from(usuarios).where(inArray(usuarios.id, ids))
+		? (pedir(await sb.from('usuarios').select('id, nombre').in('id', ids)) as Array<{ id: string; nombre: string }>)
 		: [];
-	const ocupantes = await db
-		.select({
-			usuarioId: ocupaciones.usuarioId,
-			relacion: ocupaciones.relacion,
-			calle: viviendas.calle,
-			numero: viviendas.numero,
-			viviendaId: viviendas.id
-		})
-		.from(ocupaciones)
-		.innerJoin(viviendas, eq(viviendas.id, ocupaciones.viviendaId))
-		.where(and(eq(viviendas.fraccionamientoId, fraId), isNull(ocupaciones.hasta)));
+	const ocupantes = pedir(
+		await sb
+			.from('ocupaciones')
+			.select('usuario_id, relacion, vivienda_id, viviendas!inner(calle, numero, fraccionamiento_id)')
+			.is('hasta', null)
+			.eq('viviendas.fraccionamiento_id', fraId)
+	) as Array<{ usuario_id: string; relacion: string; vivienda_id: string; viviendas: { calle: string; numero: string } }>;
 
 	const personas = relevantes
 		.map((fila) => {
 			const persona = gente.find((item) => item.id === fila.id);
-			const casa = ocupantes.find((item) => item.usuarioId === fila.id);
+			const casa = ocupantes.find((item) => item.usuario_id === fila.id);
 			return {
 				id: fila.id,
 				nombre: persona?.nombre ?? 'Persona',
@@ -343,86 +332,72 @@ export async function listarReincidentes(fraId: string) {
 				en365: fila.en365,
 				nivel: clasificarReincidencia(fila.en90, fila.en365),
 				relacion: casa?.relacion ?? null,
-				direccion: casa ? direccion(casa.calle, casa.numero) : null,
-				viviendaId: casa?.viviendaId ?? null
+				direccion: casa ? direccion(casa.viviendas.calle, casa.viviendas.numero) : null,
+				viviendaId: casa?.vivienda_id ?? null
 			};
 		})
 		.sort((a, b) => b.en90 - a.en90 || b.en365 - a.en365 || a.nombre.localeCompare(b.nombre, 'es'));
 
-	const porCasa = await conteoViviendas(fraId);
-	const casas = await db.select().from(viviendas).where(eq(viviendas.fraccionamientoId, fraId));
+	const porCasa = conteoViviendas(hechos);
+	const casas = pedir(await sb.from('viviendas').select('id, calle, numero').eq('fraccionamiento_id', fraId)) as Array<{
+		id: string;
+		calle: string;
+		numero: string;
+	}>;
+	const casaIds = casas.map((casa) => casa.id);
+	const ocupantesNombres = casaIds.length
+		? (pedir(
+				await sb
+					.from('ocupaciones')
+					.select('vivienda_id, usuarios!inner(nombre)')
+					.in('vivienda_id', casaIds)
+					.is('hasta', null)
+			) as Array<{ vivienda_id: string; usuarios: { nombre: string } }>)
+		: [];
 	const viviendasRepetidas = porCasa
 		.filter((fila) => fila.en365 >= 2)
 		.map((fila) => {
 			const casa = casas.find((item) => item.id === fila.id);
-			const habitantes = ocupantes.filter((item) => item.viviendaId === fila.id).map((item) => item.usuarioId);
-			const nombres = habitantes
-				.map((id) => gente.find((item) => item.id === id)?.nombre)
-				.filter((nombre): nombre is string => Boolean(nombre));
 			return {
 				id: fila.id,
 				direccion: casa ? direccion(casa.calle, casa.numero) : 'Vivienda',
 				en365: fila.en365,
-				habitantes: nombres
+				habitantes: ocupantesNombres.filter((item) => item.vivienda_id === fila.id).map((item) => item.usuarios.nombre)
 			};
 		})
 		.sort((a, b) => b.en365 - a.en365 || a.direccion.localeCompare(b.direccion, 'es'));
-
-	const nombresFaltantes = viviendasRepetidas.some((casa) => casa.habitantes.length === 0);
-	if (nombresFaltantes || viviendasRepetidas.length > 0) {
-		const ocupantesNombres = await db
-			.select({ usuarioId: usuarios.id, nombre: usuarios.nombre, viviendaId: ocupaciones.viviendaId })
-			.from(ocupaciones)
-			.innerJoin(usuarios, eq(usuarios.id, ocupaciones.usuarioId))
-			.where(and(inArray(ocupaciones.viviendaId, casas.map((casa) => casa.id)), isNull(ocupaciones.hasta)));
-		for (const casa of viviendasRepetidas) {
-			casa.habitantes = ocupantesNombres.filter((item) => item.viviendaId === casa.id).map((item) => item.nombre);
-		}
-	}
 
 	return { personas, viviendas: viviendasRepetidas };
 }
 
 export async function listarViviendas(fraId: string, ids: string[] | null) {
 	if (ids && ids.length === 0) return [];
-	const db = await getDb();
-	const condiciones = [eq(viviendas.fraccionamientoId, fraId)];
-	if (ids) condiciones.push(inArray(viviendas.id, ids));
-	const casas = await db
-		.select()
-		.from(viviendas)
-		.where(and(...condiciones))
-		.orderBy(viviendas.calle, viviendas.numero);
-
+	const sb = getDb();
+	let consulta = sb.from('viviendas').select('id, calle, numero').eq('fraccionamiento_id', fraId);
+	if (ids) consulta = consulta.in('id', ids);
+	const casas = pedir(await consulta.order('calle').order('numero')) as Array<{ id: string; calle: string; numero: string }>;
 	const casaIds = casas.map((casa) => casa.id);
 	if (casaIds.length === 0) return [];
 
-	const duenos = await db
-		.select({ viviendaId: titularidades.viviendaId, nombre: usuarios.nombre, usuarioId: usuarios.id })
-		.from(titularidades)
-		.innerJoin(usuarios, eq(usuarios.id, titularidades.usuarioId))
-		.where(and(inArray(titularidades.viviendaId, casaIds), isNull(titularidades.hasta)));
-	const habitantes = await db
-		.select({
-			viviendaId: ocupaciones.viviendaId,
-			usuarioId: usuarios.id,
-			nombre: usuarios.nombre,
-			relacion: ocupaciones.relacion
-		})
-		.from(ocupaciones)
-		.innerJoin(usuarios, eq(usuarios.id, ocupaciones.usuarioId))
-		.where(and(inArray(ocupaciones.viviendaId, casaIds), isNull(ocupaciones.hasta)));
-	const conteos = await conteoViviendas(fraId);
+	const duenos = pedir(
+		await sb.from('titularidades').select('vivienda_id, usuarios!inner(id, nombre)').in('vivienda_id', casaIds).is('hasta', null)
+	) as Array<{ vivienda_id: string; usuarios: { id: string; nombre: string } }>;
+	const habitantes = pedir(
+		await sb
+			.from('ocupaciones')
+			.select('vivienda_id, relacion, usuarios!inner(id, nombre)')
+			.in('vivienda_id', casaIds)
+			.is('hasta', null)
+	) as Array<{ vivienda_id: string; relacion: string; usuarios: { id: string; nombre: string } }>;
+	const conteos = conteoViviendas(await incidenciasDelFraccionamiento(fraId));
 
 	return casas.map((casa) => ({
 		id: casa.id,
 		direccion: direccion(casa.calle, casa.numero),
-		duenos: duenos
-			.filter((item) => item.viviendaId === casa.id)
-			.map((item) => ({ id: item.usuarioId, nombre: item.nombre })),
+		duenos: duenos.filter((item) => item.vivienda_id === casa.id).map((item) => item.usuarios),
 		habitantes: habitantes
-			.filter((item) => item.viviendaId === casa.id)
-			.map((item) => ({ id: item.usuarioId, nombre: item.nombre, relacion: item.relacion })),
+			.filter((item) => item.vivienda_id === casa.id)
+			.map((item) => ({ id: item.usuarios.id, nombre: item.usuarios.nombre, relacion: item.relacion })),
 		confirmadas: conteos.find((item) => item.id === casa.id)?.en365 ?? 0,
 		abiertas: conteos.find((item) => item.id === casa.id)?.abiertas ?? 0
 	}));
@@ -432,51 +407,37 @@ export async function obtenerVivienda(fraId: string, id: string) {
 	const lista = await listarViviendas(fraId, [id]);
 	const vivienda = lista[0];
 	if (!vivienda) return null;
-	const db = await getDb();
-	const duenos = await db
-		.select({
-			id: usuarios.id,
-			nombre: usuarios.nombre,
-			telefono: usuarios.telefono,
-			desde: titularidades.desde
-		})
-		.from(titularidades)
-		.innerJoin(usuarios, eq(usuarios.id, titularidades.usuarioId))
-		.where(and(eq(titularidades.viviendaId, id), isNull(titularidades.hasta)));
-	const habitantes = await db
-		.select({
-			id: usuarios.id,
-			nombre: usuarios.nombre,
-			telefono: usuarios.telefono,
-			relacion: ocupaciones.relacion,
-			desde: ocupaciones.desde
-		})
-		.from(ocupaciones)
-		.innerJoin(usuarios, eq(usuarios.id, ocupaciones.usuarioId))
-		.where(and(eq(ocupaciones.viviendaId, id), isNull(ocupaciones.hasta)));
-	const hechos = await listarIncidencias(fraId, {
-		restringir: true,
-		viviendaIds: [id],
-		usuarioId: 'nadie'
-	});
+	const sb = getDb();
+	const duenos = pedir(
+		await sb.from('titularidades').select('desde, usuarios!inner(id, nombre, telefono)').eq('vivienda_id', id).is('hasta', null)
+	) as Array<{ desde: string; usuarios: { id: string; nombre: string; telefono: string | null } }>;
+	const habitantes = pedir(
+		await sb
+			.from('ocupaciones')
+			.select('relacion, desde, usuarios!inner(id, nombre, telefono)')
+			.eq('vivienda_id', id)
+			.is('hasta', null)
+	) as Array<{ relacion: string; desde: string; usuarios: { id: string; nombre: string; telefono: string | null } }>;
+	const hechos = await listarIncidencias(fraId, { restringir: true, viviendaIds: [id], usuarioId: 'nadie' });
 	const cargos = await cuotasConSaldo(fraId, [id]);
-	return { ...vivienda, duenosDetalle: duenos, habitantesDetalle: habitantes, incidencias: hechos, cuotas: cargos };
+	return {
+		...vivienda,
+		duenosDetalle: duenos.map((fila) => ({ ...fila.usuarios, desde: fila.desde })),
+		habitantesDetalle: habitantes.map((fila) => ({ ...fila.usuarios, relacion: fila.relacion, desde: fila.desde })),
+		incidencias: hechos,
+		cuotas: cargos
+	};
 }
 
 export async function listarPersonas(fraId: string) {
-	const db = await getDb();
-	const filasMiembro = await db
-		.select({
-			id: usuarios.id,
-			nombre: usuarios.nombre,
-			telefono: usuarios.telefono,
-			rol: membresias.rol
-		})
-		.from(membresias)
-		.innerJoin(usuarios, eq(usuarios.id, membresias.usuarioId))
-		.where(eq(membresias.fraccionamientoId, fraId))
-		.orderBy(usuarios.nombre);
-	const conteos = await conteoPersonas(fraId);
+	const sb = getDb();
+	const filasMiembro = pedir(
+		await sb
+			.from('membresias')
+			.select('rol, usuarios!inner(id, nombre, telefono)')
+			.eq('fraccionamiento_id', fraId)
+	) as Array<{ rol: string; usuarios: { id: string; nombre: string; telefono: string | null } }>;
+	const conteos = conteoPersonas(await incidenciasDelFraccionamiento(fraId));
 	const casas = await listarViviendas(fraId, null);
 	const grupos = new Map<
 		string,
@@ -492,22 +453,22 @@ export async function listarPersonas(fraId: string) {
 		}
 	>();
 	for (const fila of filasMiembro) {
-		let persona = grupos.get(fila.id);
+		let persona = grupos.get(fila.usuarios.id);
 		if (!persona) {
-			const conteo = conteos.find((item) => item.id === fila.id);
+			const conteo = conteos.find((item) => item.id === fila.usuarios.id);
 			const en90 = conteo?.en90 ?? 0;
 			const en365 = conteo?.en365 ?? 0;
 			persona = {
-				id: fila.id,
-				nombre: fila.nombre,
-				telefono: fila.telefono,
+				id: fila.usuarios.id,
+				nombre: fila.usuarios.nombre,
+				telefono: fila.usuarios.telefono,
 				roles: [],
 				en90,
 				en365,
 				nivel: clasificarReincidencia(en90, en365),
 				lugares: []
 			};
-			grupos.set(fila.id, persona);
+			grupos.set(fila.usuarios.id, persona);
 		}
 		persona.roles.push(fila.rol);
 	}
@@ -515,8 +476,7 @@ export async function listarPersonas(fraId: string) {
 		for (const habitante of casa.habitantes) {
 			const persona = grupos.get(habitante.id);
 			if (!persona || persona.lugares.some((lugar) => lugar.startsWith(casa.direccion))) continue;
-			const texto =
-				habitante.relacion === 'arrendatario' ? 'renta' : habitante.relacion === 'familiar' ? 'familiar' : 'vive aquí';
+			const texto = habitante.relacion === 'arrendatario' ? 'renta' : habitante.relacion === 'familiar' ? 'familiar' : 'vive aquí';
 			persona.lugares.push(`${casa.direccion} · ${texto}`);
 		}
 		for (const dueno of casa.duenos) {
@@ -529,45 +489,45 @@ export async function listarPersonas(fraId: string) {
 }
 
 export async function obtenerPersona(fraId: string, id: string) {
-	const db = await getDb();
-	const miembros = await db
-		.select({ rol: membresias.rol, nombre: usuarios.nombre, correo: usuarios.correo, telefono: usuarios.telefono })
-		.from(membresias)
-		.innerJoin(usuarios, eq(usuarios.id, membresias.usuarioId))
-		.where(and(eq(membresias.usuarioId, id), eq(membresias.fraccionamientoId, fraId)));
+	const sb = getDb();
+	const miembros = pedir(
+		await sb
+			.from('membresias')
+			.select('rol, usuarios!inner(nombre, correo, telefono)')
+			.eq('usuario_id', id)
+			.eq('fraccionamiento_id', fraId)
+	) as Array<{ rol: string; usuarios: { nombre: string; correo: string; telefono: string | null } }>;
 	if (miembros.length === 0) return null;
-	const conteos = await conteoPersonas(fraId);
-	const conteo = conteos.find((item) => item.id === id) ?? { en90: 0, en365: 0 };
-	const resultado = await db.execute(sql`
-		select i.categoria as categoria, count(*) as total
-		from implicados im
-		join incidencias i on i.id = im.incidencia_id
-		where im.usuario_id = ${id}
-			and i.fraccionamiento_id = ${fraId}
-			and i.estado = 'confirmada'
-		group by i.categoria
-		order by total desc
-	`);
-	const porCategoria = filas<{ categoria: string; total: unknown }>(resultado).map((fila) => ({
-		categoria: fila.categoria,
-		total: numero(fila.total)
-	}));
-	const hechos = await db
-		.select({
-			id: incidencias.id,
-			categoria: incidencias.categoria,
-			gravedad: incidencias.gravedad,
-			estado: incidencias.estado,
-			ocurrioEn: incidencias.ocurrioEn,
-			calle: viviendas.calle,
-			numero: viviendas.numero
-		})
-		.from(implicados)
-		.innerJoin(incidencias, eq(incidencias.id, implicados.incidenciaId))
-		.innerJoin(viviendas, eq(viviendas.id, incidencias.viviendaId))
-		.where(and(eq(implicados.usuarioId, id), eq(incidencias.fraccionamientoId, fraId), eq(incidencias.estado, 'confirmada')))
-		.orderBy(desc(incidencias.ocurrioEn));
-
+	const hechos = await incidenciasDelFraccionamiento(fraId);
+	const conteo = conteoPersonas(hechos).find((item) => item.id === id) ?? { en90: 0, en365: 0 };
+	const confirmadas = hechos.filter(
+		(fila) => fila.estado === 'confirmada' && (fila.implicados ?? []).some((implicado) => implicado.usuario_id === id)
+	);
+	const porCategoriaMapa = new Map<string, number>();
+	for (const fila of confirmadas) {
+		const categoria = fila.categoria ?? 'otra';
+		porCategoriaMapa.set(categoria, (porCategoriaMapa.get(categoria) ?? 0) + 1);
+	}
+	const porCategoria = [...porCategoriaMapa.entries()]
+		.map(([categoria, total]) => ({ categoria, total }))
+		.sort((a, b) => b.total - a.total);
+	const detalle = pedir(
+		await sb
+			.from('implicados')
+			.select('incidencias!inner(id, categoria, gravedad, estado, ocurrio_en, fraccionamiento_id, viviendas!inner(calle, numero))')
+			.eq('usuario_id', id)
+			.eq('incidencias.fraccionamiento_id', fraId)
+			.eq('incidencias.estado', 'confirmada')
+	) as Array<{
+		incidencias: {
+			id: string;
+			categoria: string;
+			gravedad: string;
+			estado: string;
+			ocurrio_en: string;
+			viviendas: { calle: string; numero: string };
+		};
+	}>;
 	const casas = await listarViviendas(fraId, null);
 	const lugares = casas
 		.filter((casa) => casa.duenos.some((dueno) => dueno.id === id) || casa.habitantes.some((item) => item.id === id))
@@ -578,42 +538,72 @@ export async function obtenerPersona(fraId: string, id: string) {
 
 	return {
 		id,
-		nombre: miembros[0].nombre,
-		correo: miembros[0].correo,
-		telefono: miembros[0].telefono,
+		nombre: miembros[0].usuarios.nombre,
+		correo: miembros[0].usuarios.correo,
+		telefono: miembros[0].usuarios.telefono,
 		roles: miembros.map((item) => item.rol),
 		en90: conteo.en90,
 		en365: conteo.en365,
 		nivel: clasificarReincidencia(conteo.en90, conteo.en365),
 		porCategoria,
-		incidencias: hechos.map((fila) => ({ ...fila, direccion: direccion(fila.calle, fila.numero) })),
+		incidencias: detalle
+			.map((fila) => ({
+				id: fila.incidencias.id,
+				categoria: fila.incidencias.categoria,
+				gravedad: fila.incidencias.gravedad,
+				estado: fila.incidencias.estado,
+				ocurrioEn: fila.incidencias.ocurrio_en,
+				direccion: direccion(fila.incidencias.viviendas.calle, fila.incidencias.viviendas.numero)
+			}))
+			.sort((a, b) => new Date(b.ocurrioEn).getTime() - new Date(a.ocurrioEn).getTime()),
 		lugares
 	};
 }
 
+type CuotaFila = {
+	id: string;
+	vivienda_id: string;
+	concepto: string;
+	periodo: string;
+	monto_centavos: number;
+	vencimiento: string;
+};
+
 async function cuotasConSaldo(fraId: string, viviendaIds?: string[]) {
 	if (viviendaIds && viviendaIds.length === 0) return [];
-	const db = await getDb();
-	const condiciones = [eq(cuotas.fraccionamientoId, fraId)];
-	if (viviendaIds) condiciones.push(inArray(cuotas.viviendaId, viviendaIds));
-	const lista = await db.select().from(cuotas).where(and(...condiciones)).orderBy(desc(cuotas.periodo));
+	const sb = getDb();
+	let consulta = sb
+		.from('cuotas')
+		.select('id, vivienda_id, concepto, periodo, monto_centavos, vencimiento')
+		.eq('fraccionamiento_id', fraId);
+	if (viviendaIds) consulta = consulta.in('vivienda_id', viviendaIds);
+	const lista = pedir(await consulta.order('periodo', { ascending: false })) as CuotaFila[];
 	const ids = lista.map((cuota) => cuota.id);
-	const abonos = ids.length ? await db.select().from(pagos).where(inArray(pagos.cuotaId, ids)) : [];
+	const abonos = ids.length
+		? (pedir(await sb.from('pagos').select('cuota_id, monto_centavos').in('cuota_id', ids)) as Array<{
+				cuota_id: string;
+				monto_centavos: number;
+			}>)
+		: [];
 	const pagado = new Map<string, number>();
-	for (const pago of abonos) pagado.set(pago.cuotaId, (pagado.get(pago.cuotaId) ?? 0) + pago.montoCentavos);
+	for (const pago of abonos) pagado.set(pago.cuota_id, (pagado.get(pago.cuota_id) ?? 0) + numero(pago.monto_centavos));
 	const hoy = hoyMexico();
-	const casas = await db.select().from(viviendas).where(eq(viviendas.fraccionamientoId, fraId));
+	const casas = pedir(await sb.from('viviendas').select('id, calle, numero').eq('fraccionamiento_id', fraId)) as Array<{
+		id: string;
+		calle: string;
+		numero: string;
+	}>;
 	return lista.map((cuota) => {
 		const abono = pagado.get(cuota.id) ?? 0;
-		const saldo = cuota.montoCentavos - abono;
-		const casa = casas.find((item) => item.id === cuota.viviendaId);
+		const saldo = numero(cuota.monto_centavos) - abono;
+		const casa = casas.find((item) => item.id === cuota.vivienda_id);
 		return {
 			id: cuota.id,
-			viviendaId: cuota.viviendaId,
+			viviendaId: cuota.vivienda_id,
 			direccion: casa ? direccion(casa.calle, casa.numero) : 'Vivienda',
 			concepto: cuota.concepto,
 			periodo: cuota.periodo,
-			montoCentavos: cuota.montoCentavos,
+			montoCentavos: numero(cuota.monto_centavos),
 			vencimiento: cuota.vencimiento,
 			abono,
 			saldo,
@@ -634,27 +624,26 @@ export async function registrarPago(input: {
 	pagadoEn: string;
 	usuarioId: string;
 }) {
-	const db = await getDb();
-	const encontradas = await db
-		.select()
-		.from(cuotas)
-		.where(and(eq(cuotas.id, input.cuotaId), eq(cuotas.fraccionamientoId, input.fraId)))
-		.limit(1);
-	const cuota = encontradas[0];
+	const sb = getDb();
+	const cuota = pedir(
+		await sb.from('cuotas').select('id, monto_centavos').eq('id', input.cuotaId).eq('fraccionamiento_id', input.fraId).maybeSingle()
+	) as { id: string; monto_centavos: number } | null;
 	if (!cuota) return { ok: false as const, error: 'No encontramos esa cuota.' };
-	const abonos = await db.select().from(pagos).where(eq(pagos.cuotaId, cuota.id));
-	const pagado = abonos.reduce((suma, pago) => suma + pago.montoCentavos, 0);
-	const saldo = cuota.montoCentavos - pagado;
+	const abonos = pedir(await sb.from('pagos').select('monto_centavos').eq('cuota_id', cuota.id)) as Array<{ monto_centavos: number }>;
+	const pagado = abonos.reduce((suma, pago) => suma + numero(pago.monto_centavos), 0);
+	const saldo = numero(cuota.monto_centavos) - pagado;
 	if (input.montoCentavos <= 0 || input.montoCentavos > saldo) {
 		return { ok: false as const, error: 'El monto tiene que ser mayor a cero y no pasar el saldo.' };
 	}
-	await db.insert(pagos).values({
-		id: randomUUID(),
-		cuotaId: cuota.id,
-		montoCentavos: input.montoCentavos,
-		pagadoEn: input.pagadoEn,
-		registradoPor: input.usuarioId
-	});
+	pedir(
+		await sb.from('pagos').insert({
+			id: randomUUID(),
+			cuota_id: cuota.id,
+			monto_centavos: input.montoCentavos,
+			pagado_en: input.pagadoEn,
+			registrado_por: input.usuarioId
+		})
+	);
 	return { ok: true as const };
 }
 
@@ -665,29 +654,31 @@ export async function generarCuotas(input: {
 	montoCentavos: number;
 	vencimiento: string;
 }) {
-	const db = await getDb();
-	const casas = await db.select().from(viviendas).where(eq(viviendas.fraccionamientoId, input.fraId));
+	const sb = getDb();
+	const casas = pedir(await sb.from('viviendas').select('id').eq('fraccionamiento_id', input.fraId)) as Array<{ id: string }>;
 	if (casas.length === 0) return 0;
-	const insertadas = await db
-		.insert(cuotas)
-		.values(
-			casas.map((casa) => ({
-				id: randomUUID(),
-				fraccionamientoId: input.fraId,
-				viviendaId: casa.id,
-				concepto: input.concepto.trim(),
-				periodo: input.periodo,
-				montoCentavos: input.montoCentavos,
-				vencimiento: input.vencimiento
-			}))
-		)
-		.onConflictDoNothing({ target: [cuotas.viviendaId, cuotas.periodo, cuotas.concepto] })
-		.returning({ id: cuotas.id });
+	const insertadas = pedir(
+		await sb
+			.from('cuotas')
+			.upsert(
+				casas.map((casa) => ({
+					id: randomUUID(),
+					fraccionamiento_id: input.fraId,
+					vivienda_id: casa.id,
+					concepto: input.concepto.trim(),
+					periodo: input.periodo,
+					monto_centavos: input.montoCentavos,
+					vencimiento: input.vencimiento
+				})),
+				{ onConflict: 'vivienda_id,periodo,concepto', ignoreDuplicates: true }
+			)
+			.select('id')
+	) as Array<{ id: string }>;
 	return insertadas.length;
 }
 
 export async function resumenInicio(fraId: string, usuarioId: string, roles: Rol[], vinculos: Vinculos) {
-	const db = await getDb();
+	const sb = getDb();
 	const relacionadas = viviendasRelacionadas(vinculos);
 	const comite = esComite(roles);
 	const recientes = await listarIncidencias(fraId, {
@@ -702,10 +693,9 @@ export async function resumenInicio(fraId: string, usuarioId: string, roles: Rol
 	let cuotasVencidas = 0;
 	let personas: Awaited<ReturnType<typeof listarReincidentes>>['personas'] = [];
 	if (comite) {
-		const abiertas = await db
-			.select({ id: incidencias.id })
-			.from(incidencias)
-			.where(and(eq(incidencias.fraccionamientoId, fraId), inArray(incidencias.estado, ['reportada', 'en_revision'])));
+		const abiertas = pedir(
+			await sb.from('incidencias').select('id').eq('fraccionamiento_id', fraId).in('estado', ['reportada', 'en_revision'])
+		) as Array<{ id: string }>;
 		porRevisar = abiertas.length;
 		const todas = await cuotasConSaldo(fraId);
 		cuotasVencidas = todas.filter((cuota) => cuota.vencida).length;

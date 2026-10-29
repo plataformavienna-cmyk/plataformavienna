@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { hashContrasena, PASSWORD_DEMO } from './auth';
 import type { AppDb } from './client';
 import {

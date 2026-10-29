@@ -1,7 +1,7 @@
 import { cerrarSesion, crearSesion, leerSesion, membresiasDe, vincularUsuarioGoogle } from '@vienna/db';
 import type { Handle, RequestEvent } from '@sveltejs/kit';
 import { COOKIE, opcionesCookie } from '$lib/server/sesion';
-import { crearClienteSupabase } from '$lib/server/supabase';
+import { crearClienteSupabase, publicarEntorno } from '$lib/server/supabase';
 
 function vaciar(event: RequestEvent) {
 	event.locals.token = null;
@@ -79,6 +79,7 @@ async function entrarConGoogle(event: RequestEvent) {
 }
 
 export const handle: Handle = async ({ event, resolve }) => {
+	publicarEntorno();
 	vaciar(event);
 	const ruta = event.url.pathname;
 	if (ruta.startsWith('/_app/') || ruta.includes('.')) return resolve(event);
