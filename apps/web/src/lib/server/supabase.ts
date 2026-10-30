@@ -22,6 +22,20 @@ export function googleConfigurado() {
 	return Boolean(env.PUBLIC_SUPABASE_URL && env.PUBLIC_SUPABASE_ANON_KEY);
 }
 
+export async function googleHabilitado() {
+	const url = env.PUBLIC_SUPABASE_URL;
+	const llave = env.PUBLIC_SUPABASE_ANON_KEY;
+	if (!url || !llave || esLlaveSecreta(llave)) return false;
+	try {
+		const respuesta = await fetch(`${url}/auth/v1/settings`, { headers: { apikey: llave } });
+		if (!respuesta.ok) return false;
+		const datos = (await respuesta.json()) as { external?: { google?: boolean } };
+		return Boolean(datos.external?.google);
+	} catch {
+		return false;
+	}
+}
+
 export function crearClienteSupabase(event: RequestEvent) {
 	const url = env.PUBLIC_SUPABASE_URL;
 	const llave = env.PUBLIC_SUPABASE_ANON_KEY;

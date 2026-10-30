@@ -40,13 +40,13 @@ async function entrarConCookie(event: RequestEvent) {
 	asignar(event, sesion);
 }
 
-async function entrarConGoogle(event: RequestEvent) {
+async function entrarConSupabase(event: RequestEvent) {
 	const supabase = event.locals.supabase;
 	if (!supabase) return;
 	const { data } = await supabase.auth.getUser();
 	const authUser = data.user;
 	if (!authUser?.email) {
-		await olvidarCookie(event);
+		await entrarConCookie(event);
 		return;
 	}
 
@@ -87,7 +87,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	event.locals.token = event.cookies.get(COOKIE) ?? null;
 	event.locals.supabase = crearClienteSupabase(event);
 
-	if (event.locals.supabase) await entrarConGoogle(event);
+	if (event.locals.supabase) await entrarConSupabase(event);
 	else await entrarConCookie(event);
 
 	return resolve(event);
