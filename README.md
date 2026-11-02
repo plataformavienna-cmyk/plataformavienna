@@ -1,60 +1,157 @@
 # Vienna
 
-Registro de conductas para fraccionamientos. Sirve para ubicar vecinos reincidentes —música en la madrugada, basura, estacionamiento— y, aparte, llevar las cuotas del dueño.
+Registro de conductas para fraccionamientos. Ubica vecinos reincidentes (música en la madrugada, basura, estacionamiento) y, aparte, lleva las cuotas del dueño. Quien renta y quien es dueño tienen cuentas distintas.
 
-Una persona puede rentar una casa sin ser dueña. El dueño tiene su propia cuenta aunque no viva ahí.
+**Repo:** https://github.com/plataformavienna-cmyk/plataformavienna.git
 
-## Por qué Postgres
+Stack: monorepo **pnpm** + **SvelteKit** (`apps/web`) + **Supabase** (`packages/db`). Node **22+**.
 
-Dueño, habitante, vivienda e incidencia son relaciones. La reincidencia es un conteo por persona y por casa, en 90 días y en un año. Postgres lo resuelve sin armar el vínculo a mano. Esta Mac y Vercel usan la misma base en [Supabase](https://supabase.com).
+---
 
-## Arrancar
+## 1. Bajar el proyecto
 
-En `apps/web/.env` van `PUBLIC_SUPABASE_URL`, `PUBLIC_SUPABASE_ANON_KEY` y `SERVICE_ROLE_KEY`. Ejecuta `supabase/schema.sql` en el editor SQL. Después:
+```bash
+git clone https://github.com/plataformavienna-cmyk/plataformavienna.git
+cd plataformavienna
+```
+
+### Abrirlo en el editor
+
+| Herramienta | Cómo |
+|-------------|------|
+| **Cursor** | `File → Open Folder` → carpeta `plataformavienna`. O en la terminal: `cursor .` |
+| **VS Code** | `File → Open Folder` → misma carpeta. O: `code .` |
+| **Claude Code** | Entra a la carpeta del repo y abre la sesión ahí (`cd plataformavienna` antes de lanzar Claude). El contexto del agente debe ser la raíz del monorepo, no solo `apps/web`. |
+
+No abras solo `apps/web` como raíz del workspace: faltan `packages/db` y el `pnpm-workspace.yaml`.
+
+---
+
+## 2. Requisitos en la máquina
+
+1. **Node.js 22 o mayor** (`node -v`).
+2. **pnpm 11** (el repo declara `packageManager`):
+
+```bash
+corepack enable
+corepack prepare pnpm@11.21.0 --activate
+pnpm -v
+```
+
+---
+
+## 3. Instalar dependencias
+
+En la **raíz** del repo:
 
 ```bash
 pnpm install
-pnpm dev
 ```
 
-Abre http://localhost:5173.
+---
 
-`VIENNA_SEED=1` carga las cuentas de demostración solo si el proyecto está vacío. La contraseña es `Demo-2026`. Para verlas en la pantalla de entrada también hace falta `VIENNA_DEMO=1`. Quítalas cuando ya haya vecinos reales. Elena Vargas administra Los Encinos y Bugambilias; Mariana Solís es dueña de Encino 12 y no vive ahí; Diego Herrera renta esa casa.
+## 4. Variables de entorno
 
-## Supabase
-
-1. Crea un proyecto.
-2. En el editor SQL, ejecuta `supabase/schema.sql` completo.
-3. En Authentication → Providers → Google, actívalo. Ahí van el Client ID y el Client Secret de Google Cloud (pantalla de consentimiento externa, y el redirect `https://<ref>.supabase.co/auth/v1/callback`).
-4. En Authentication → URL configuration, agrega:
-   - `http://localhost:5173/auth/callback`
-   - `https://<tu-app>.vercel.app/auth/callback`
-5. En `apps/web/.env`:
-
+```bash
+cp apps/web/.env.example apps/web/.env
 ```
+
+Edita `apps/web/.env` (Project Settings → API en Supabase):
+
+```env
 PUBLIC_SUPABASE_URL=https://<ref>.supabase.co
 PUBLIC_SUPABASE_ANON_KEY=<anon public>
 SERVICE_ROLE_KEY=<service_role>
 ```
 
-El navegador solo usa la URL y la llave anon para entrar con Google. Las consultas las hace el servidor con `SERVICE_ROLE_KEY`, filtrando por el fraccionamiento de la sesión.
+- `PUBLIC_*` las usa el navegador (Google / Auth).
+- `SERVICE_ROLE_KEY` **solo el servidor**. No le pongas el prefijo `PUBLIC_`.
+- `DATABASE_URL` (opcional): solo para crear/actualizar tablas con `pnpm db:aplicar`. Es la conexión directa, puerto **5432**. Si la contraseña tiene `@`, `"`, `}`, etc., codifícala en la URL.
 
-Quien entre con Google y no tenga una membresía con ese correo ve una página de espera. Administración lo da de alta en `usuarios` y `membresias` usando ese mismo correo.
+No subas `.env` a git (ya está en `.gitignore`).
 
-## Vercel
+---
 
-El build ya usa `@sveltejs/adapter-vercel`.
+## 5. Tablas en Supabase
 
-1. Importa el repositorio.
-2. Root Directory: `apps/web`.
-3. Activa «Include source files outside of the Root Directory», porque el código de la base vive en `packages/db`.
-4. Variables de entorno: `PUBLIC_SUPABASE_URL`, `PUBLIC_SUPABASE_ANON_KEY`, `SERVICE_ROLE_KEY`.
-5. Agrega la URL de producción en las redirecciones de Supabase, como arriba.
+Si el proyecto aún no tiene el esquema:
 
-## Qué ve cada cuenta
+1. Pega y ejecuta `supabase/schema.sql` en el **SQL Editor** de Supabase, **o**
+2. Con `DATABASE_URL` en el `.env`:
 
-- Administración y comité: incidencias, confirmación, reincidentes, directorio y cuotas. El pago lo registra solo administración.
-- Dueño: sus viviendas, quién las habita, las incidencias de esas casas y sus cuotas. No ve el directorio ni quién reportó.
-- Habitante: puede reportar y ver el estado de lo que ocurre en su vivienda. No ve teléfonos de otros vecinos ni la lista de reincidentes.
+```bash
+pnpm db:aplicar
+```
 
-Un reporte no suma como reincidencia hasta que alguien del comité lo confirma y marca a la persona.
+Eso crea fraccionamientos, usuarios, viviendas, incidencias, cuotas, etc., y el disparador de Google.
+
+---
+
+## 6. Arrancar en local
+
+```bash
+pnpm dev
+```
+
+Abre **http://localhost:5173**.
+
+Comandos útiles:
+
+```bash
+pnpm check          # tipos / svelte-check
+pnpm build          # build de producción (adaptador Vercel)
+pnpm db:aplicar     # aplica supabase/schema.sql
+```
+
+### Auth
+
+- **Correo:** pestaña Entrar (correo + contraseña) o Crear cuenta (nombre + correo + contraseña).
+- **Google:** solo aparece si en Supabase → Authentication → Providers → Google está **Enable**. Redirects:
+  - `http://localhost:5173/auth/callback`
+  - `https://<tu-app>.vercel.app/auth/callback`
+- Sin membresía en un fraccionamiento, la cuenta llega a una pantalla de espera. Hay que darla de alta en `usuarios` / `membresias` con ese correo.
+
+### Datos de demostración (opcional)
+
+Solo en un proyecto vacío, en `.env`:
+
+```env
+VIENNA_SEED=1
+VIENNA_DEMO=1
+```
+
+Contraseña de demo: `Demo-2026`. Quítalas en producción.
+
+---
+
+## 7. Continuar con un agente (Cursor / Claude Code)
+
+Pistas cortas para el agente:
+
+- Raíz del monorepo = este README.
+- App: `apps/web` (SvelteKit 2 + Svelte 5 + Tailwind 4).
+- Datos: `packages/db` (cliente Supabase con `SERVICE_ROLE_KEY`).
+- Esquema SQL: `supabase/schema.sql`.
+- Plantilla de env: `apps/web/.env.example`.
+- UI en español (México). No commits ni push salvo que lo pidan.
+- No pegues secretos del `.env` en el chat ni en el README.
+
+---
+
+## 8. Publicar en Vercel
+
+1. Importa `plataformavienna-cmyk/plataformavienna`.
+2. **Root Directory:** `apps/web`.
+3. Activa *Include source files outside of the Root Directory* (hace falta `packages/db`).
+4. Env: `PUBLIC_SUPABASE_URL`, `PUBLIC_SUPABASE_ANON_KEY`, `SERVICE_ROLE_KEY`.
+5. Suma el dominio de Vercel en las URL de Auth de Supabase.
+
+---
+
+## Qué ve cada rol
+
+- **Administración / comité:** incidencias, confirmación, reincidentes, directorio y cuotas (el pago lo registra administración).
+- **Dueño:** sus viviendas, habitantes, incidencias de esas casas y cuotas. No ve el directorio ni quién reportó.
+- **Habitante:** reporta y ve lo de su vivienda. No ve teléfonos ajenos ni reincidentes.
+
+Un reporte no cuenta como reincidencia hasta que el comité lo confirma y marca a la persona.
